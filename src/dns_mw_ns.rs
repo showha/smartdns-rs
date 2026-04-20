@@ -398,17 +398,17 @@ async fn lookup_ip(
 
             // Sort IPs by min elapsed time, take top ones (e.g., top 3 or all if less)
             let mut sorted_ips: Vec<(IpAddr, Duration)> = ip_addr_stats
-                .into_iter()
-                .filter_map(|(ip, (_, elapsed))| elapsed.map(|e| (ip, e)))
+                .iter()
+                .filter_map(|(ip, (_, elapsed))| elapsed.map(|e| (*ip, *e)))
                 .collect();
             sorted_ips.sort_by_key(|(_, e)| *e);
             fastest_ips = sorted_ips.into_iter().take(3).map(|(ip, _)| ip).collect(); // Return top 3, adjust as needed
 
             if fastest_ips.is_empty() {
                 ip_addr_stats
-                    .into_iter()
+                    .iter()
                     .max_by_key(|(_, (n, _))| *n)
-                    .map(|(ip, _)| vec![ip])
+                    .map(|(ip, _)| vec![*ip])
                     .unwrap_or_default()
             } else {
                 fastest_ips
@@ -478,7 +478,7 @@ async fn multi_mode_ping_fastest_all(
     name: Name,
     ip_addrs: Vec<IpAddr>,
     modes: Vec<SpeedCheckMode>,
-) -> Vec<IpAddr> {
+) -> Option<Vec<IpAddr>> {
     use crate::infra::ping::{PingOptions, ping};
     let duration = Duration::from_millis(200);
     let ping_ops = PingOptions::default().with_timeout_secs(2);
@@ -513,8 +513,12 @@ async fn multi_mode_ping_fastest_all(
     }
 
     // Sort by elapsed time and return all successful IPs
-    ping_results.sort_by_key(|(_, e)| *e);
-    ping_results.into_iter().map(|(ip, _)| ip).collect()
+    if ping_results.is_empty() {
+        None
+    } else {
+        ping_results.sort_by_key(|(_, e)| *e);
+        Some(ping_results.into_iter().map(|(ip, _)| ip).collect())
+    }
 }
 
 async fn multi_mode_ping_fastest(
