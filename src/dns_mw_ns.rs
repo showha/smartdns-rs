@@ -234,17 +234,17 @@ async fn lookup_ip(
     let mut ok_tasks = vec![];
     let mut err_tasks = vec![];
 
-    let selected_ip = match response_strategy {
+    let selected_ips = match response_strategy {
         FirstPing => {
             let mut ping_tasks = vec![];
-            let mut fastest_ip = None;
+            let mut fastest_ips = vec![];
             loop {
                 let (ping_res, query_res) = match (query_tasks.len(), ping_tasks.len()) {
                     (0, 0) => break,
                     (0, _) => {
-                        let (fastest_ip, _, rest) = select_all(ping_tasks).await;
+                        let (fastest_ips_res, _, rest) = select_all(ping_tasks).await;
                         ping_tasks = rest;
-                        (fastest_ip, None)
+                        (fastest_ips_res, None)
                     }
                     (_, 0) => {
                         let (res, _idx, rest) = select_all(query_tasks).await;
@@ -256,10 +256,10 @@ async fn lookup_ip(
                         let b = select_all(query_tasks);
                         let c = select(a, b).await;
                         match c {
-                            Either::Left(((fastest_ip, _, rest), other)) => {
+                            Either::Left(((fastest_ips_res, _, rest), other)) => {
                                 ping_tasks = rest;
                                 query_tasks = other.into_inner();
-                                (fastest_ip, None)
+                                (fastest_ips_res, None)
                             }
                             Either::Right(((res, _, rest), other)) => {
                                 query_tasks = rest;
@@ -270,8 +270,8 @@ async fn lookup_ip(
                     }
                 };
 
-                if let Some(ip) = ping_res {
-                    fastest_ip = Some(ip);
+                if let Some(ips) = ping_res {
+                    fastest_ips = ips;
                     break;
                 }
 
@@ -284,7 +284,7 @@ async fn lookup_ip(
                             }
                             ok_tasks.push(lookup);
                             ping_tasks.push(
-                                multi_mode_ping_fastest(
+                                multi_mode_ping_fastest_all(
                                     name.clone(),
                                     ip_addrs,
                                     speed_check_mode.to_vec(),
@@ -300,29 +300,29 @@ async fn lookup_ip(
                 }
             }
 
-            match fastest_ip {
-                Some(ip) => Some(ip),
-                None => {
-                    let ip_addr_stats = ok_tasks.iter().flat_map(|r| r.ip_addrs()).fold(
-                        HashMap::<IpAddr, usize>::new(),
-                        |mut map, ip| {
-                            map.entry(ip).and_modify(|n| *n += 1).or_insert(1);
-                            map
-                        },
-                    );
-                    ip_addr_stats
-                        .into_iter()
-                        .max_by_key(|(_, n)| *n)
-                        .map(|(ip, _)| ip)
-                }
+            if fastest_ips.is_empty() {
+                let ip_addr_stats = ok_tasks.iter().flat_map(|r| r.ip_addrs()).fold(
+                    HashMap::<IpAddr, usize>::new(),
+                    |mut map, ip| {
+                        map.entry(ip).and_modify(|n| *n += 1).or_insert(1);
+                        map
+                    },
+                );
+                ip_addr_stats
+                    .into_iter()
+                    .max_by_key(|(_, n)| *n)
+                    .map(|(ip, _)| vec![ip])
+                    .unwrap_or_default()
+            } else {
+                fastest_ips
             }
         }
         FastestIp => {
             let mut ping_tasks = vec![];
 
-            let mut ip_addr_stats = HashMap::new();
+            let mut ip_addr_stats = HashMap::<IpAddr, (u8, Option<Duration>)>::new();
 
-            let mut fastest_ip: Option<PingOutput> = None;
+            let mut fastest_ips = vec![];
 
             loop {
                 #[allow(clippy::type_complexity)]
@@ -361,27 +361,11 @@ async fn lookup_ip(
                 };
 
                 if let Some(Ok(out)) = ping_res {
-                    if match fastest_ip.as_ref() {
-                        Some(t) => out.elapsed() < t.elapsed(),
-                        None => {
-                            // first get speed, add timeout
-                            query_tasks = query_tasks
-                                .into_iter()
-                                .map(|q| {
-                                    async {
-                                        match q.timeout(Duration::from_millis(200)).await {
-                                            Ok(t) => t,
-                                            Err(_) => Err(ProtoErrorKind::Timeout.into()),
-                                        }
-                                    }
-                                    .boxed()
-                                })
-                                .collect();
-
-                            true
+                    let ip = out.dest().ip_addr();
+                    if let Some((_, min_elapsed)) = ip_addr_stats.get_mut(&ip) {
+                        if min_elapsed.map_or(true, |e| out.elapsed() < e) {
+                            *min_elapsed = Some(out.elapsed());
                         }
-                    } {
-                        fastest_ip = Some(out);
                     }
                 }
 
@@ -391,7 +375,7 @@ async fn lookup_ip(
                             let ip_addrs = lookup.ip_addrs();
 
                             for ip_addr in &ip_addrs {
-                                *ip_addr_stats.entry(*ip_addr).or_insert_with(|| {
+                                ip_addr_stats.entry(*ip_addr).or_insert_with(|| {
                                     ping_tasks.push(
                                         multi_mode_ping(
                                             name.clone(),
@@ -400,8 +384,8 @@ async fn lookup_ip(
                                         )
                                         .boxed(),
                                     );
-                                    0u8
-                                }) += 1;
+                                    (0, None)
+                                }).0 += 1;
                             }
                             ok_tasks.push(lookup);
                         }
@@ -412,12 +396,22 @@ async fn lookup_ip(
                 }
             }
 
-            match fastest_ip {
-                Some(fastest_ip) => Some(fastest_ip.dest().ip_addr()),
-                None => ip_addr_stats
+            // Sort IPs by min elapsed time, take top ones (e.g., top 3 or all if less)
+            let mut sorted_ips: Vec<(IpAddr, Duration)> = ip_addr_stats
+                .into_iter()
+                .filter_map(|(ip, (_, elapsed))| elapsed.map(|e| (ip, e)))
+                .collect();
+            sorted_ips.sort_by_key(|(_, e)| *e);
+            fastest_ips = sorted_ips.into_iter().take(3).map(|(ip, _)| ip).collect(); // Return top 3, adjust as needed
+
+            if fastest_ips.is_empty() {
+                ip_addr_stats
                     .into_iter()
-                    .max_by_key(|(_, n)| *n)
-                    .map(|(ip, _)| ip),
+                    .max_by_key(|(_, (n, _))| *n)
+                    .map(|(ip, _)| vec![ip])
+                    .unwrap_or_default()
+            } else {
+                fastest_ips
             }
         }
         FastestResponse => {
@@ -446,18 +440,29 @@ async fn lookup_ip(
         }
     };
 
-    if let Some(selected_ip) = selected_ip {
-        for mut res in ok_tasks {
-            let record = res
-                .take_answers()
-                .into_iter()
-                .find(|r| matches!(r.data().ip_addr(), Some(ip) if ip == selected_ip));
-            if let Some(record) = record {
-                res.add_answer(record);
-                return Ok(res);
+    if !selected_ips.is_empty() {
+        // Find the response with the most matching IPs
+        let mut best_response = None;
+        let mut max_matches = 0;
+        for res in &ok_tasks {
+            let matches = res.ip_addrs().iter().filter(|ip| selected_ips.contains(ip)).count();
+            if matches > max_matches {
+                max_matches = matches;
+                best_response = Some(res.clone());
             }
         }
-        unreachable!()
+        if let Some(mut res) = best_response {
+            let mut selected_records = vec![];
+            for ip in &selected_ips {
+                if let Some(record) = res.take_answers().into_iter().find(|r| matches!(r.data().ip_addr(), Some(record_ip) if record_ip == *ip)) {
+                    selected_records.push(record);
+                }
+            }
+            for record in selected_records {
+                res.add_answer(record);
+            }
+            return Ok(res);
+        }
     }
 
     match ok_tasks.into_iter().next() {
@@ -467,6 +472,49 @@ async fn lookup_ip(
             None => unreachable!(),
         },
     }
+}
+
+async fn multi_mode_ping_fastest_all(
+    name: Name,
+    ip_addrs: Vec<IpAddr>,
+    modes: Vec<SpeedCheckMode>,
+) -> Vec<IpAddr> {
+    use crate::infra::ping::{PingOptions, ping};
+    let duration = Duration::from_millis(200);
+    let ping_ops = PingOptions::default().with_timeout_secs(2);
+
+    let mut ping_results = vec![];
+
+    for mode in &modes {
+        debug!("Speed test {} {:?} ping {:?}", name, mode, ip_addrs);
+        let dests = mode.to_ping_addrs(&ip_addrs);
+
+        for dest in dests {
+            let ping_task = ping(dest, ping_ops).boxed();
+            let timeout_task = sleep(duration).boxed();
+            match futures_util::future::select(ping_task, timeout_task).await {
+                futures::future::Either::Left((ping_res, _)) => {
+                    if let Ok(ping_out) = ping_res {
+                        let ip = ping_out.dest().ip_addr();
+                        debug!(
+                            "Ping success for {}: {}, delay: {:?}",
+                            name,
+                            ip,
+                            ping_out.elapsed()
+                        );
+                        ping_results.push((ip, ping_out.elapsed()));
+                    }
+                }
+                futures::future::Either::Right((_, _)) => {
+                    // timeout
+                }
+            }
+        }
+    }
+
+    // Sort by elapsed time and return all successful IPs
+    ping_results.sort_by_key(|(_, e)| *e);
+    ping_results.into_iter().map(|(ip, _)| ip).collect()
 }
 
 async fn multi_mode_ping_fastest(
