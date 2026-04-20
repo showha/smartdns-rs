@@ -7,7 +7,7 @@ use crate::dns_client::{LookupOptions, NameServer};
 
 use crate::infra::ipset::{IpMap, IpSet};
 use crate::infra::ping::{PingError, PingOutput};
-use crate::third_ext::FutureTimeoutExt;
+// use crate::third_ext::FutureTimeoutExt;
 use crate::{
     config::{ResponseMode, SpeedCheckMode, SpeedCheckModeList},
     dns::*,
@@ -244,7 +244,7 @@ async fn lookup_ip(
                     (0, _) => {
                         let (fastest_ips_res, _, rest) = select_all(ping_tasks).await;
                         ping_tasks = rest;
-                        (fastest_ips_res, None)
+                        (Some(fastest_ips_res), None)
                     }
                     (_, 0) => {
                         let (res, _idx, rest) = select_all(query_tasks).await;
@@ -259,7 +259,7 @@ async fn lookup_ip(
                             Either::Left(((fastest_ips_res, _, rest), other)) => {
                                 ping_tasks = rest;
                                 query_tasks = other.into_inner();
-                                (fastest_ips_res, None)
+                                (Some(fastest_ips_res), None)
                             }
                             Either::Right(((res, _, rest), other)) => {
                                 query_tasks = rest;
